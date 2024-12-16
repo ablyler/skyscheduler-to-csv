@@ -1,66 +1,162 @@
 <?php
 
-define('SKYSCHEDULER_DOMAIN', ''); // example: umflyers.skyscheduler.com
-define('USERNAME', '');
-define('PASSWORD', '');
+$options = getopt('', [
+    'domain:',
+    'username:',
+    'start_date::',
+    'end_date::',
+    'help'
+]);
 
-// login
-http_request('/?ReturnUrl=%2fFlightLog.aspx%3fSDate%3d2%252f28%252f1900%26EDate%3d3%252f28%252f2050', 'ctl00%24ctl00%24ctl00%24ctl03=ctl00%24ctl00%24ctl00%24body%24bannerbody%24rightcolumn%24ctl01%7C&__LASTFOCUS=&ctl00_ctl00_ctl00_ctl03_HiddenField=&__EVENTTARGET=ctl00%24ctl00%24ctl00%24body%24bannerbody%24rightcolumn%24Login&__EVENTARGUMENT=&__VIEWSTATE=%2FwEPDwUKMTYyMTkxNDIxMGQYAQUeX19Db250cm9sc1JlcXVpcmVQb3N0QmFja0tleV9fFgEFOGN0bDAwJGN0bDAwJGN0bDAwJGJvZHkkYmFubmVyYm9keSRyaWdodGNvbHVtbiRSZW1lbWJlck1l%2B37f3%2Fbu6UZqkThPJ9OC84WiiDk%3D&__EVENTVALIDATION=%2FwEWBQKpgafZCwLIjrzlAwLD5tLDAgLCi4zCBwLUlYL6Bks%2FT65VkfgZs%2FuZuT%2B9swfNROb9&ctl00%24ctl00%24ctl00%24body%24bannerbody%24rightcolumn%24Username=' . urlencode(USERNAME) . '&ctl00%24ctl00%24ctl00%24body%24bannerbody%24rightcolumn%24Password=' . urlencode(PASSWORD) . '&__ASYNCPOST=true&');
-
-// obtain the html of the flight log
-$html = http_request('/FlightLog.aspx?SDate=2%2f28%2f1900&EDate=3%2f28%2f2050');
-
-// replace line breaks with spaces
-$html = str_replace('<br>', ' ', $html);
-
-// obtain all the log entries
-preg_match_all('/edit<\/a><\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<td align="center">([^<]*)<\/td>\s+<\/tr>(\s+<tr class="small [^\"]+">\s+<td>&nbsp\;<\/td>\s+<td colspan=4>)?([^<]*)?/', $html, $matches, PREG_SET_ORDER);
-
-// output the header
-echo "date\taircraft\tfrom\tto\tinstr_app\tldg\tairplane_sel\tairplane_mel\tcross_country\tday\tnight\tactual_instrument\tsimulated_instrument\tsimulator\tdual_received\tpilot_in_command\ttotal_duration\tremarks\n";
-
-// parse each log entires
-foreach ($matches as &$fields)
-{
-	// remove the field that contains the entire string of HTML
-	unset($fields[0]);
-
-	// hack to remove field that contains html
-	unset($fields[18]);
-
-	// clean up the format of each fields
-	foreach ($fields as &$field)
-	{
-		$field = trim($field);
-		$field = str_replace('&nbsp;', ' ', $field);
-		$field = preg_replace('/\s+/', ' ', $field);
-	}
-
-	// seperate the fields by tabs
-	echo implode("\t", $fields) . "\n";
+if (isset($options['help'])) {
+    print_usage();
+    exit(0);
 }
 
-function http_request($uri, $post_fields = null)
+// Required arguments
+if (empty($options['domain']) || empty($options['username'])) {
+    fwrite(STDERR, "Error: --domain and --username are required.\n");
+    print_usage();
+    exit(1);
+}
+
+$domain = $options['domain'];
+$username = $options['username'];
+
+// Optional arguments with defaults
+$start_date = $options['start_date'] ?? '2/28/1900';
+$end_date = $options['end_date'] ?? '3/28/2050';
+
+// Prompt for password
+fwrite(STDOUT, "Enter password for $username@$domain: ");
+$password = read_input_line();
+if (empty($password)) {
+    fwrite(STDERR, "Error: Password cannot be empty.\n");
+    exit(1);
+}
+
+// Construct URI
+$uri = '/FlightLog?SDate=' . urlencode($start_date) . '&EDate=' . urlencode($end_date);
+
+// Fetch flight log HTML
+$html = http_request($domain, $uri);
+
+if ($html === false) {
+    fwrite(STDERR, "Error: Failed to fetch the flight log from $domain.\n");
+    exit(1);
+}
+
+// Parse HTML using DOMDocument
+$dom = new DOMDocument();
+libxml_use_internal_errors(true);  // Suppress HTML parsing warnings
+$dom->loadHTML($html);
+libxml_clear_errors();
+
+$xpath = new DOMXPath($dom);
+
+// Select only the flight data rows, excluding header, totals, and remark rows
+$rows = $xpath->query("//table[@class='autocolor']/tr[
+    not(@id='headers') 
+    and not(@id='pageTotal') 
+    and not(@id='forward') 
+    and not(@id='total')
+    and not(@class='remark')
+]");
+
+// output to stdout
+$output = fopen('php://output', 'w');
+
+// Add UTF-8 BOM for Excel compatibility
+fwrite($output, "\xEF\xBB\xBF");
+
+// Print the CSV header
+fputcsv($output, [
+    "Date", "Aircraft", "From", "To", "No Instr App", "No Ldg", "Airplane SEL", 
+    "Airplane MEL", "Cross Country", "Day", "Night", "Actual Instrument", 
+    "Simulated Instrument", "Simulator", "Dual Received", "Pilot In Command", 
+    "Total Duration", "Remarks"
+], ",", '"', "\\");
+
+foreach ($rows as $row) {
+    // Extract relevant columns, skipping the first "edit" link column
+    $columns = $xpath->query("td[position() > 1]", $row);
+    $fields = [];
+
+    foreach ($columns as $column) {
+        $value = trim(preg_replace('/\s+/', ' ', $column->textContent));
+        $fields[] = ($value === '&nbsp;' || $value === '') ? '' : $value;
+    }
+
+    // Ensure we have at least 17 fields (the flight data columns)
+    if (count($fields) < 17) {
+        continue;
+    }
+
+    // Find the first following remark row
+    $remarkRows = $xpath->query("following-sibling::tr[@class='remark'][1]", $row);
+    $remarks = '';
+
+    if ($remarkRows->length > 0) {
+        $remarkRow = $remarkRows->item(0);
+        // Remarks are in the second td of the remark row
+        $remarkTd = $xpath->query("td[2]", $remarkRow);
+        if ($remarkTd->length > 0) {
+            $remarks = trim($remarkTd->item(0)->textContent);
+        }
+    }
+
+    $fields[] = $remarks; // Append remarks to the end
+
+    // Output CSV row
+    fputcsv($output, $fields, ",", '"', "\\");
+}
+
+fclose($output);
+
+function http_request($domain, $uri, $post_fields = null)
 {
-	$headers = array(
-		'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_6_7) AppleWebKit/534.24 (KHTML, like Gecko) Chrome/11.0.696.16 Safari/534.24',
-		'Accept: application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5',
-		'Accept-Language: en-US,en;q=0.8',
-		'Accept-Charset: ISO-8859-1,utf-8;q=0.7,*;q=0.3',
-	);
+    $headers = [
+        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:118.0) Gecko/20100101 Firefox/118.0',
+        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language: en-US,en;q=0.5',
+    ];
 
-	$ch = curl_init('http://' . SKYSCHEDULER_DOMAIN . $uri);
+    $ch = curl_init('http://' . $domain . $uri);
 
-	curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-	curl_setopt($ch, CURLOPT_COOKIEFILE, '/tmp/cookiefile.txt'); 
-	curl_setopt($ch, CURLOPT_COOKIEJAR,  '/tmp/cookiefile.txt');
-	curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_COOKIEFILE, '/tmp/cookiefile.txt');
+    curl_setopt($ch, CURLOPT_COOKIEJAR, '/tmp/cookiefile.txt');
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 
-	if ($post_fields !== null)
-	{
-		curl_setopt($ch, CURLOPT_POST, 1);
-		curl_setopt($ch, CURLOPT_POSTFIELDS, $post_fields);
-	}
+    if ($post_fields !== null) {
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $post_fields);
+    }
 
-	return curl_exec($ch);
+    return curl_exec($ch);
+}
+
+function print_usage()
+{
+    fwrite(STDOUT, "Usage: php skyscheduler-to-csv.php --domain DOMAIN --username USERNAME [--start_date \"MM/DD/YYYY\"] [--end_date \"MM/DD/YYYY\"] [--output OUTPUTFILE] [--help]\n");
+    fwrite(STDOUT, "\n");
+    fwrite(STDOUT, "Required arguments:\n");
+    fwrite(STDOUT, "  --domain      The domain of the SkyManager site (e.g. umflyers.skymanager.com)\n");
+    fwrite(STDOUT, "  --username    The username for SkyManager\n");
+    fwrite(STDOUT, "  (The password will be prompted for securely)\n");
+    fwrite(STDOUT, "\n");
+    fwrite(STDOUT, "Optional arguments:\n");
+    fwrite(STDOUT, "  --start_date  Start date for the flight log (default: 2/28/1900)\n");
+    fwrite(STDOUT, "  --end_date    End date for the flight log (default: 3/28/2050)\n");
+    fwrite(STDOUT, "  --help        Display this help message\n");
+    fwrite(STDOUT, "\n");
+}
+
+function read_input_line()
+{
+    if (function_exists('readline')) {
+        return rtrim(readline(""));
+    } else {
+        return rtrim(fgets(STDIN));
+    }
 }
